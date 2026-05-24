@@ -1,0 +1,106 @@
+name: CI/CD Practica Profesional directory
+
+on:
+  push:
+    branches: ['despliegue-de-pruebas']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build with Maven
+        run: |
+          sed -i 's/\r$//' mvnw || true
+          chmod +x mvnw || true
+          ./mvnw clean package -DskipTests
+
+      - name: Login Dockerhub
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: echo $DOCKER_PASSWORD | docker login -u $DOCKER_USERNAME --password-stdin
+
+      - name: Build and push Docker image
+        run: |
+          docker build -t $DOCKER_USERNAME/practica-profesional-directory:latest .
+          docker push $DOCKER_USERNAME/practica-profesional-directory:latest
+
+  deploy:
+    runs-on: self-hosted
+    needs: build
+    env:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+
+    steps:
+      - name: Create Docker Network
+        run: |
+          docker network create --driver bridge --opt com.docker.network.driver.mtu=1400 maestria-network || echo "Network already exists"
+
+      - name: Infrastructure Diagnosis & Cleanup
+        run: |
+          echo "--- DISK SPACE CHECK ---"
+          df -h || true
+          echo "--- CLEANING OLD CONTAINER ---"
+          docker rm -f directory-service || true
+
+      - name: Pull Application Image (with Retry Logic)
+        run: |
+          echo "Attempting to pull image with auto-retry for stability..."
+          for i in 1 2 3; do
+            docker pull $DOCKER_USERNAME/practica-profesional-directory:latest && exit 0 || \
+            (echo "Attempt $i failed, waiting 10s..." && sleep 10)
+          done
+          echo "All pull attempts failed."
+          exit 1
+
+      - name: Run Application Container
+        run: |
+          docker run -d \
+            --name "directory-service" \
+            --network "maestria-network" \
+            --network-alias "directory" \
+            -p 8765:8761 \
+            --restart "always" \
+            --memory "256m" \
+            --memory-swap "256m" \
+            --label project="practica-u" \
+            --label service="directory" \
+            -e JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -XX:+UseSerialGC -Xms64m -Xmx192m" \
+            $DOCKER_USERNAME/practica-profesional-directory:latest
+
+      - name: Clean Old Images of This Service
+        run: |
+          echo "Cleaning old images for directory service..."
+          CURRENT_IMAGE=$(docker inspect directory-service --format='{{.Image}}' 2>/dev/null || echo "")
+          if [ -n "$CURRENT_IMAGE" ]; then
+            docker images --filter "label=service=directory" --format "{{.ID}}" | while read img; do
+              if [ "$img" != "${CURRENT_IMAGE:7:12}" ]; then
+                echo "Removing old image: $img"
+                docker rmi -f $img 2>/dev/null || true
+              fi
+            done
+          fi
+          docker images $DOCKER_USERNAME/practica-profesional-directory --format "{{.ID}} {{.Tag}}" | grep -v "latest" | awk '{print $1}' | xargs -r docker rmi -f 2>/dev/null || true
+
+      - name: Clean Stopped Containers of This Service
+        run: |
+          echo "Cleaning stopped containers for directory service..."
+          docker ps -a --filter "label=service=directory" --filter "status=exited" -q | xargs -r docker rm 2>/dev/null || true
+
+      - name: Final Status Check
+        run: |
+          sleep 5
+          docker ps | grep directory-service || true
+          echo "--- LAST 20 LINES OF LOGS ---"
+          docker logs --tail 20 directory-service || true
